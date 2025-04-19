@@ -1,9 +1,8 @@
 import odrive
 import odrive.enums # Import enums for constants
-# import odrive.utils # Redundant if using 'from ... import *'
 from odrive.utils import * # Import utils for functions like dump_errors
 
-# import serial # Arduino dependency - commented out
+import serial # Arduino dependency 
 import time
 import csv
 import numpy as np
@@ -15,14 +14,18 @@ import math
 import os
 
 # --- Configuration ---
-# ARDUINO_PORT = 'COM5'  # Arduino dependency - commented out
-# ARDUINO_BAUD = 115200 # Arduino dependency - commented out
+ARDUINO_PORT = 'COM7'  # Arduino dependency - adjust as needed
+ARDUINO_BAUD = 115200 # Arduino dependency
 CSV_FILENAME_TEMPLATE = "data/wheel_test_{test_name}_{timestamp}.csv"
 SAMPLE_RATE_HZ = 50
 
 # --- Global Variables for Threading ---
 odrive_data_queue = queue.Queue()
+arduino_data_queue = queue.Queue()
 collection_active = threading.Event()
+
+# Global variables for Arduino serial connection
+arduino_ser = None
 
 # --- Helper Functions ---
 def connect_to_odrive():
@@ -140,14 +143,130 @@ def odrive_reader(odrv):
              sleep_time = next_sample_time - current_time - 0.001
              if sleep_time > 0: time.sleep(sleep_time)
 
-# --- Data Processing (Unchanged) ---
+def arduino_reader(arduino_port, arduino_baud):
+    """Thread function to read data from Arduino and put it in a queue."""
+    global arduino_ser
+    
+    # Always close the existing connection first to avoid resource conflicts
+    if arduino_ser is not None:
+        try:
+            arduino_ser.close()
+            print("Closed existing Arduino connection")
+        except:
+            pass
+        arduino_ser = None
+    
+    try:
+        # Create a fresh connection for each test
+        print(f"Opening Arduino serial port {arduino_port} at {arduino_baud} baud...")
+        arduino_ser = serial.Serial(arduino_port, arduino_baud, timeout=0.1)  # Reduced timeout for faster response
+        print(f"Arduino serial port opened successfully")
+        arduino_ser.flushInput()
+        
+        # Try reading some initial data to verify connection
+        print("Checking Arduino data...")
+        initial_check_time = time.time()
+        initial_data_found = False
+        
+        # Try for up to 1 second to get initial data
+        while time.time() - initial_check_time < 1.0 and not initial_data_found:
+            if arduino_ser.in_waiting > 0:
+                try:
+                    test_data = arduino_ser.readline().decode('utf-8').strip()
+                    if test_data:
+                        print(f"Arduino connection verified with data: {test_data[:30]}...")
+                        initial_data_found = True
+                except:
+                    pass
+            time.sleep(0.01)
+            
+        if not initial_data_found:
+            print("WARNING: No initial Arduino data detected!")
+        
+        # Read loop
+        data_count = 0
+        last_report_time = time.time()
+        empty_read_count = 0
+        
+        while collection_active.is_set():
+            try:
+                # Check if there's data waiting
+                if arduino_ser.in_waiting > 0:
+                    # Read a line from the Arduino
+                    raw_data = arduino_ser.readline()
+                    
+                    # Try to decode it
+                    if raw_data:
+                        data = raw_data.decode('utf-8').strip()
+                        if data:
+                            # Debug: print first few samples
+                            if data_count < 5:
+                                print(f"Arduino data sample {data_count+1}: {data[:50]}...")
+                            
+                            # Add to queue
+                            arduino_data_queue.put(data)
+                            data_count += 1
+                            empty_read_count = 0
+                            
+                            # Periodically report count
+                            current_time = time.time()
+                            if current_time - last_report_time > 5.0:
+                                print(f"Arduino data collected: {data_count} samples")
+                                last_report_time = current_time
+                else:
+                    # Keep track of consecutive empty reads
+                    empty_read_count += 1
+                    if empty_read_count >= 100 and empty_read_count % 500 == 0:
+                        print(f"Warning: {empty_read_count} consecutive empty reads from Arduino")
+                    time.sleep(0.01)  # Short sleep when no data
+                        
+            except UnicodeDecodeError:
+                print(f"Arduino decode error - received binary data: {raw_data}")
+            except Exception as e:
+                print(f"Arduino read error: {e}")
+                time.sleep(0.01)  # Reduced sleep time to avoid missing data
+        
+        print(f"Arduino data collection complete: {data_count} total samples")
+        
+    except serial.SerialException as e:
+        print(f"ERROR: Could not open Arduino serial port {arduino_port}: {e}")
+        print("Check Arduino connection and COM port settings")
+    except Exception as e:
+        print(f"Unexpected error in Arduino reader: {e}")
+
+# --- Data Processing ---
 def merge_and_save_data(test_name):
-    """Saves ODrive data ONLY to CSV."""
-    print("Saving ODrive data...")
+    """
+    Saves both ODrive and Arduino data to a single CSV file.
+    Data from both sources will be merged based on timestamps.
+    """
+    print("Saving test data...")
+    
+    # Get ODrive data from queue
     odrive_data = []
-    while not odrive_data_queue.empty(): odrive_data.append(odrive_data_queue.get_nowait())
+    while not odrive_data_queue.empty():
+        odrive_data.append(odrive_data_queue.get_nowait())
     print(f"Processing {len(odrive_data)} ODrive samples")
-    if not odrive_data: print("No ODrive data collected."); return
+    
+    # Get Arduino data from queue
+    arduino_data = []
+    while not arduino_data_queue.empty():
+        try:
+            json_str = arduino_data_queue.get_nowait()
+            try:
+                data = json.loads(json_str)
+                # Add the source identifier
+                data['source'] = 'arduino'
+                arduino_data.append(data)
+            except json.JSONDecodeError as e:
+                print(f"Warning: Failed to parse Arduino JSON data: {e}")
+        except Exception as e:
+            print(f"Warning: Error retrieving Arduino data: {e}")
+    print(f"Processing {len(arduino_data)} Arduino samples")
+    
+    if not odrive_data and not arduino_data:
+        print("No data collected.")
+        return
     
     # Ensure data directory exists
     if not os.path.exists("data"):
@@ -155,16 +274,50 @@ def merge_and_save_data(test_name):
     
     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = CSV_FILENAME_TEMPLATE.format(test_name=test_name, timestamp=timestamp_str)
-    fieldnames = ['timestamp', 'voltage', 'current_q', 'current_d', 'velocity', 'position',
-                  'temperature', 'axis_error', 'motor_error', 'encoder_error']
-    odrive_data.sort(key=lambda x: x['sys_time'])
-    for record in odrive_data: record['timestamp'] = record.pop('sys_time')
+    
+    # Define all possible fields for the combined CSV
+    odrive_fields = ['timestamp', 'voltage', 'current_q', 'current_d', 'velocity', 'position',
+                     'temperature', 'axis_error', 'motor_error', 'encoder_error']
+    
+    arduino_fields = ['ts', 'ax', 'ay', 'az', 'gx', 'gy', 'gz', 'roll', 'pitch', 'yaw', 'source']
+    
+    # Build a merged dataset
+    merged_data = []
+    
+    # Add ODrive data to merged set with source identifier
+    for item in odrive_data:
+        record = {field: '' for field in odrive_fields + arduino_fields}  # Initialize with empty values
+        for field in odrive_fields:
+            if field in item:
+                record[field] = item[field]
+        record['source'] = 'odrive'
+        merged_data.append(record)
+    
+    # Add Arduino data to merged set
+    for item in arduino_data:
+        record = {field: '' for field in odrive_fields + arduino_fields}  # Initialize with empty values
+        for field in arduino_fields:
+            if field in item:
+                record[field] = item[field]
+        # Convert Arduino timestamp to match format if needed
+        if 'ts' in item:
+            record['timestamp'] = item['ts'] / 1000.0  # Convert ms to seconds
+        merged_data.append(record)
+    
+    # Sort the merged data by timestamp
+    merged_data.sort(key=lambda x: float(x['timestamp']) if x['timestamp'] != '' else float('inf'))
+    
+    # Write to CSV
+    all_fields = odrive_fields + [f for f in arduino_fields if f not in odrive_fields]
     try:
         with open(filename, 'w', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore'); writer.writeheader(); writer.writerows(odrive_data)
+            writer = csv.DictWriter(csvfile, fieldnames=all_fields)
+            writer.writeheader()
+            for row in merged_data:
+                writer.writerow(row)
         print(f"Data successfully saved to {filename}")
-    except IOError as e: print(f"Error writing CSV {filename}: {e}")
-    except Exception as e: print(f"Unexpected error writing CSV: {e}")
+    except Exception as e:
+        print(f"Error writing CSV file: {e}")
 
 # --- Test Execution Function (Modified) ---
 def run_distance_test(odrv, test_name, target_velocity_rps, radius_cm, target_distance_m=0.80):
@@ -255,20 +408,34 @@ def run_distance_test(odrv, test_name, target_velocity_rps, radius_cm, target_di
     estimated_move_time = target_revolutions / effective_velocity + effective_velocity / existing_accel_limit
     print(f"Estimated move time: {estimated_move_time:.2f} seconds (using configured limits)")
     
-    # Create a thread lock to prevent multiple executions
-    movement_lock = threading.Lock()
+    # Global synchronization lock
+    global movement_lock
+    if not hasattr(run_distance_test, 'movement_lock'):
+        run_distance_test.movement_lock = threading.Lock()
     
     # Make sure collection is not active from previous tests
     collection_active.clear()
     
+    # Ensure any existing threads are stopped
+    time.sleep(0.2)
+    
     # Acquire lock before starting the movement sequence
-    with movement_lock:
+    with run_distance_test.movement_lock:
         # Start Data Collection
         print("Starting ODrive data collection thread...")
         collection_active.set()
         odrive_thread = threading.Thread(target=odrive_reader, args=(odrv,), daemon=True)
         odrive_thread.start()
         time.sleep(0.1)
+        
+        # Start Arduino data collection thread
+        print("Starting Arduino data collection thread...")
+        arduino_thread = threading.Thread(target=arduino_reader, args=(ARDUINO_PORT, ARDUINO_BAUD), daemon=True)
+        arduino_thread.start()
+        time.sleep(0.1)
+        
+        # Wait for both threads to start
+        time.sleep(0.5)
         
         # First enable closed loop control
         print("\n--- Initiating Movement ---")
@@ -358,89 +525,101 @@ def run_distance_test(odrv, test_name, target_velocity_rps, radius_cm, target_di
 # --- Main Execution Logic (Using Step-by-Step Calibration) ---
 def main():
     """Main function to connect, configure, calibrate, run ODrive tests, and cleanup."""
-    odrv = None
+    global arduino_ser
+    
+    # Connect to ODrive
+    odrv = connect_to_odrive()
+    if not odrv:
+        print("Failed to connect to ODrive. Exiting.")
+        return
+    
+    # Try to connect to Arduino early
+    print("Initializing Arduino connection...")
     try:
-        # Connect to ODrive ONLY
-        odrv = connect_to_odrive()
-        if not odrv: print("Failed to connect to ODrive device. Exiting."); return
-
-        # Clear all errors at the start
-        clear_all_odrive_errors(odrv)
-
-        # --- Run ODrive Calibration (Using step-by-step function) ---
-        print("\n*** WARNING: ODrive calibration will spin the motor. ***"); print("*** Ensure the wheel is free to rotate without obstruction. ***")
-        input("Press Enter to start calibration...")
-        if not run_odrive_calibration(odrv): # Calls the step-by-step function
-             print("ODrive calibration failed. Exiting.")
-             # dump_errors called inside function on failure
-             return
+        arduino_ser = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+        print(f"Arduino connected on {ARDUINO_PORT}")
+        # Flush any initial data
+        arduino_ser.flushInput()
+    except Exception as e:
+        print(f"Warning: Could not initialize Arduino: {e}")
+        print("Will try again during test")
+    
+    # Clear any existing errors
+    clear_all_odrive_errors(odrv)
+    
+    # Run Calibration
+    print("\n*** WARNING: ODrive calibration will spin the motor. ***")
+    print("*** Ensure the wheel is free to rotate without obstruction. ***")
+    input("Press Enter to start calibration...")
+    
+    calibration_success = run_odrive_calibration(odrv)
+    if calibration_success:
         print("Calibration successful.")
-
-        # Ensure data directory exists
-        if not os.path.exists("data"):
-            os.makedirs("data")
-            print("Created data directory for test results.")
-
-        # Run Interactive Distance Tests
-        print("\n--- Starting Interactive Distance Test Sequence (ODrive Only) ---")
-        while True:
-            # Check connection at start of loop
-            print("\nVerifying ODrive connection before next test...")
-            try:
-                _ = odrv.vbus_voltage # Read a value to check connection
-                # Check calibration status before allowing test start
-                if not odrv.axis1.motor.is_calibrated or not odrv.axis1.encoder.is_ready:
-                     print("Error: ODrive reports axis1 is not calibrated at start of test loop. Exiting.")
-                     break # Exit loop if not calibrated
-                print("Connection OK and Axis 1 calibrated.")
-            except Exception as loop_conn_err:
-                print(f"ODrive connection lost ({loop_conn_err}). Attempting reconnect...")
-                odrv = connect_to_odrive()
-                if not odrv:
-                    print("Reconnection failed. Cannot continue tests. Exiting.")
-                    break # Exit the while loop
-                print("Reconnected successfully.")
-                # Re-check calibration after reconnect
-                if not odrv.axis1.motor.is_calibrated or not odrv.axis1.encoder.is_ready:
-                     print("Error: ODrive reports axis1 is not calibrated after reconnect. Exiting.")
-                     break
-
-
-            print("\nEnter test parameters (or type 'quit' for test name to exit):")
-            test_name = input("Enter a unique name for this test run: ")
-            if test_name.lower() == 'quit': break
-            try:
-                target_velocity_str = input(f"Enter target velocity during move (turns/sec, e.g., 1.0): ")
-                target_velocity_rps = float(target_velocity_str)
-                if target_velocity_rps <= 0: print(f"Invalid velocity. Must be > 0."); continue
-
-                radius_str = input("Enter wheel radius (cm): ")
-                radius_cm = float(radius_str)
-                if radius_cm <= 0: print("Invalid radius. Must be positive."); continue
-
-                print("\n*** Ensure the correct vertical load is applied to the wheel! ***")
-                input("Press Enter when ready to start the test...")
-
-                # Call the test function using axis1
-                run_distance_test(odrv, test_name, target_velocity_rps, radius_cm)
-
-            except ValueError: print("Invalid input. Please enter numbers.")
-            except Exception as e: print(f"An error occurred setting up or running test: {e}")
-
-        print("\n--- Test Sequence Finished ---")
-
-    except KeyboardInterrupt: print("\nProgram interrupted by user"); collection_active.clear()
-    except Exception as e: print(f"An critical error occurred in the main program: {e}"); collection_active.clear()
-    finally:
-        # Cleanup
-        print("Cleaning up resources..."); collection_active.clear(); time.sleep(0.5)
+    else:
+        print("Calibration failed. Please check ODrive connection and try again.")
+        return
+    
+    # Interactive Test Sequence
+    print("\n--- Starting Interactive Distance Test Sequence (ODrive Only) ---")
+    
+    while True:
+        # Verify ODrive is still responsive
+        print("\nVerifying ODrive connection before next test...")
+        if not hasattr(odrv, 'axis1') or not odrv.axis1.motor.is_calibrated:
+            print("ODrive connection lost or motor needs recalibration.")
+            return
+        else:
+            print("Connection OK and Axis 1 calibrated.")
+            
+        # Get test parameters from user
+        print("\nEnter test parameters (or type 'quit' for test name to exit):")
+        test_name = input("Enter a unique name for this test run: ")
+        if test_name.lower() == 'quit':
+            break
+            
+        target_velocity = input("Enter target velocity during move (turns/sec, e.g., 1.0): ")
         try:
-            if odrv and hasattr(odrv, 'axis1'):
-                print("Setting ODrive Axis 1 to IDLE state.")
-                odrv.axis1.requested_state = odrive.enums.AXIS_STATE_IDLE
-        except Exception as e: print(f"Error idling ODrive Axis 1 during cleanup: {e}")
-        print("Program finished.")
-
+            target_velocity = float(target_velocity)
+        except ValueError:
+            print("Invalid velocity. Using default of 1.0 turns/sec")
+            target_velocity = 1.0
+            
+        wheel_radius = input("Enter wheel radius (cm): ")
+        try:
+            wheel_radius = float(wheel_radius)
+            if wheel_radius <= 0:
+                raise ValueError("Radius must be positive")
+        except ValueError:
+            print("Invalid radius. Using default of 5.0 cm")
+            wheel_radius = 5.0
+            
+        # Display ready message and wait for final confirmation
+        print("\n*** Ensure the correct vertical load is applied to the wheel! ***")
+        input("Press Enter when ready to start the test...")
+        
+        # Run the test
+        run_distance_test(odrv, test_name, target_velocity, wheel_radius)
+    
+    # Test sequence complete
+    print("\n--- Test Sequence Finished ---")
+    print("Cleaning up resources...")
+    
+    # Clean shutdown
+    try:
+        # Put ODrive in idle state
+        print("Setting ODrive Axis 1 to IDLE state.")
+        odrv.axis1.requested_state = odrive.enums.AXIS_STATE_IDLE
+        
+        # Close Arduino serial port if open
+        if arduino_ser is not None:
+            print("Closing Arduino serial connection.")
+            arduino_ser.close()
+            arduino_ser = None
+            
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+    
+    print("Program finished.")
 
 if __name__ == "__main__":
     main()
