@@ -1,5 +1,8 @@
 import odrive
 import odrive.enums # Import enums for constants
+# import odrive.utils # Redundant if using 'from ... import *'
+from odrive.utils import * # Import utils for functions like dump_errors
+
 # import serial # Arduino dependency - commented out
 import time
 import csv
@@ -9,394 +12,435 @@ import threading
 import json
 import queue # Using queue for thread-safe communication
 import math
+import os
 
 # --- Configuration ---
 # ARDUINO_PORT = 'COM5'  # Arduino dependency - commented out
 # ARDUINO_BAUD = 115200 # Arduino dependency - commented out
-CSV_FILENAME_TEMPLATE = "wheel_test_data_ODRIVE_ONLY_{test_name}_{timestamp}.csv" # Updated template name
-SAMPLE_RATE_HZ = 50  # How many samples per second to target for ODrive
-
-# --- ODrive Parameter Configuration ---
-MOTOR_POLE_PAIRS = 7
-MOTOR_PHASE_RESISTANCE = 0.039
-MOTOR_KV = 270
-MOTOR_CURRENT_LIMIT = 20
-MOTOR_TYPE = odrive.enums.MOTOR_TYPE_HIGH_CURRENT
-ENCODER_MODE = odrive.enums.ENCODER_MODE_HALL
-ENCODER_CPR = MOTOR_POLE_PAIRS * 6
-POS_GAIN = 20.0
-VEL_GAIN = 0.16
-VEL_INTEGRATOR_GAIN = 0.32
-VEL_LIMIT = 10
-VBUS_VOLTAGE = 24 # CHECK YOUR ACTUAL POWER SUPPLY
-VOLTAGE_LIMIT_MARGIN = 4
-CURRENT_LIMIT_MARGIN = 5
-# !! CRITICAL: Set this to the actual value of your connected brake resistor !!
-BRAKE_RESISTANCE_OHMS = 0.5 # Ohms - CHANGE THIS TO MATCH YOUR HARDWARE
-TRAJ_ACCEL_LIMIT = 1.0
-TRAJ_DECEL_LIMIT = 1.0
+CSV_FILENAME_TEMPLATE = "data/wheel_test_{test_name}_{timestamp}.csv"
+SAMPLE_RATE_HZ = 50
 
 # --- Global Variables for Threading ---
-# arduino_data_queue = queue.Queue() # Arduino dependency - commented out
 odrive_data_queue = queue.Queue()
 collection_active = threading.Event()
 
 # --- Helper Functions ---
-
 def connect_to_odrive():
     """Connect to the ODrive."""
     print("Looking for ODrive...")
     try:
-        odrv = odrive.find_any()
+        odrv = odrive.find_any(timeout=15)
         print(f"Found ODrive! Serial: {odrv.serial_number}")
-        if hasattr(odrv, 'axis0') and odrv.axis0 is not None:
-             print("ODrive Axis 0 found.")
+        # Check for AXIS 1
+        if hasattr(odrv, 'axis1') and odrv.axis1 is not None:
+             print("ODrive Axis 1 found.")
         else:
-            print("Error: ODrive Axis 0 not found.")
+            print("Error: ODrive Axis 1 not found.")
             return None
+        # Verify communication
+        print(f"Initial VBUS voltage: {odrv.vbus_voltage:.2f}V")
         return odrv
     except Exception as e:
         print(f"Error connecting to ODrive: {e}")
         return None
 
-# def connect_to_arduino(port, baud): # Arduino dependency - commented out
-#     """Connect to the Arduino."""
-#     try:
-#         ser = serial.Serial(port, baud, timeout=1)
-#         print(f"Attempting connection to Arduino on {port}...")
-#         time.sleep(2)
-#         if ser.is_open:
-#             print(f"Connected to Arduino on {port}")
-#             ser.flushInput()
-#             return ser
-#         else:
-#             print(f"Failed to open serial port {port}")
-#             return None
-#     except serial.SerialException as e:
-#         print(f"Failed to connect to Arduino: {e}")
-#         return None
-
-# --- ODrive Configuration Function (Unchanged) ---
-def configure_odrive_parameters(odrv):
-    """Sets key ODrive parameters based on constants defined above."""
-    print("Configuring ODrive parameters...")
-    axis = odrv.axis0
+def clear_all_odrive_errors(odrv):
+    """Clear all errors on all axes (axis0 and axis1 if present)."""
+    print("Clearing all ODrive errors...")
     try:
-        # Motor Config
-        print("Setting Motor Config...")
-        axis.motor.config.pole_pairs = MOTOR_POLE_PAIRS
-        axis.motor.config.motor_type = MOTOR_TYPE
-        axis.motor.config.phase_resistance = MOTOR_PHASE_RESISTANCE
-        axis.motor.config.torque_constant = 8.27 / MOTOR_KV
-        axis.motor.config.current_lim = MOTOR_CURRENT_LIMIT
-        axis.motor.config.current_lim_margin = CURRENT_LIMIT_MARGIN
-        # Encoder Config
-        print("Setting Encoder Config...")
-        axis.encoder.config.mode = ENCODER_MODE
-        axis.encoder.config.cpr = ENCODER_CPR
-        axis.encoder.config.use_index = False
-        # Controller Config
-        print("Setting Controller Config...")
-        axis.controller.config.pos_gain = POS_GAIN
-        axis.controller.config.vel_gain = VEL_GAIN
-        axis.controller.config.vel_integrator_gain = VEL_INTEGRATOR_GAIN
-        axis.controller.config.vel_limit = VEL_LIMIT
-        axis.controller.config.control_mode = odrive.enums.CONTROL_MODE_VELOCITY_CONTROL
-        axis.controller.config.input_mode = odrive.enums.INPUT_MODE_PASSTHROUGH
-        # System Config
-        print("Setting System Config...")
-        print(f"Setting brake resistance to: {BRAKE_RESISTANCE_OHMS} Ohms (Ensure this matches hardware!)")
-        odrv.config.brake_resistance = BRAKE_RESISTANCE_OHMS
-        print(f"Setting voltage limits based on VBUS_VOLTAGE = {VBUS_VOLTAGE}V")
-        odrv.config.dc_bus_undervoltage_trip_level = 8.0
-        odrv.config.dc_bus_overvoltage_trip_level = VBUS_VOLTAGE + VOLTAGE_LIMIT_MARGIN
+        # Use the dump_errors function to report errors first
+        dump_errors(odrv)
+        
+        # Reset error states by setting error to 0
+        if hasattr(odrv, 'axis0'):
+            try:
+                odrv.axis0.error = 0
+                odrv.axis0.motor.error = 0
+                odrv.axis0.encoder.error = 0
+                odrv.axis0.controller.error = 0
+            except:
+                pass
+                
+        if hasattr(odrv, 'axis1'):
+            try:
+                odrv.axis1.error = 0
+                odrv.axis1.motor.error = 0
+                odrv.axis1.encoder.error = 0
+                odrv.axis1.controller.error = 0
+            except:
+                pass
+                
+        time.sleep(0.5)
+        print("All ODrive errors cleared.")
+    except Exception as e:
+        print(f"Error clearing ODrive errors: {e}")
 
-        print("Parameter configuration complete.")
+# --- ODrive Calibration Function (MODIFIED - Individual Steps) ---
+def run_odrive_calibration(odrv):
+    """
+    Runs the full calibration sequence using the ODrive state machine.
+    """
+    print("Starting ODrive Full Calibration Sequence...")
+    axis = odrv.axis1
+    try:
+        # Request full calibration sequence
+        axis.requested_state = odrive.enums.AXIS_STATE_FULL_CALIBRATION_SEQUENCE
+        print("  Full calibration sequence running... (Motor and encoder will spin)")
+        time.sleep(15)  # Give time for calibration to complete
+        # Check results
+        if axis.error != 0:
+            print("Error: Axis error detected after full calibration sequence.")
+            dump_errors(odrv)
+            axis.requested_state = odrive.enums.AXIS_STATE_IDLE
+            return False
+        if not axis.motor.is_calibrated or not axis.encoder.is_ready:
+            print("Error: Motor or encoder not calibrated/ready after full calibration.")
+            print(f"Motor Calibrated: {axis.motor.is_calibrated}, Encoder Ready: {axis.encoder.is_ready}")
+            dump_errors(odrv)
+            axis.requested_state = odrive.enums.AXIS_STATE_IDLE
+            return False
+        print("Full calibration sequence complete and successful.")
+        axis.requested_state = odrive.enums.AXIS_STATE_IDLE
         return True
     except Exception as e:
-        print(f"Error during ODrive parameter configuration: {e}")
+        print(f"Exception during ODrive full calibration: {e}")
+        try: dump_errors(odrv)
+        except: pass
+        try: axis.requested_state = odrive.enums.AXIS_STATE_IDLE
+        except: pass
         return False
 
-# --- ODrive Calibration Function (Unchanged) ---
-def run_odrive_calibration(odrv):
-    """Runs necessary calibration sequences."""
-    print("Starting ODrive calibration sequence...")
-    axis = odrv.axis0
-    try:
-        # Motor Calibration
-        print("Requesting Motor Calibration...")
-        axis.requested_state = odrive.enums.AXIS_STATE_MOTOR_CALIBRATION
-        time.sleep(1)
-        while axis.current_state == odrive.enums.AXIS_STATE_MOTOR_CALIBRATION: time.sleep(0.5); print("  Motor cal running...")
-        if axis.motor.error != 0 or axis.error != 0:
-            print(f"Error during motor calibration! Axis Error: {axis.error}, Motor Error: {axis.motor.error}"); odrive.dump_errors(odrv); return False
-        if not axis.motor.config.phase_resistance or axis.motor.config.phase_resistance == 0 or \
-           not axis.motor.config.phase_inductance or axis.motor.config.phase_inductance == 0:
-             print("Warning: Motor R/L invalid after calibration.")
-        else: print(f"  Motor calibration successful. R={axis.motor.config.phase_resistance:.4f}, L={axis.motor.config.phase_inductance:.6f}")
-        # Encoder Calibration
-        if ENCODER_MODE == odrive.enums.ENCODER_MODE_HALL:
-            print("Requesting Hall Polarity Calibration...")
-            axis.encoder.config.hall_polarity_calibrated = False
-            axis.requested_state = odrive.enums.AXIS_STATE_ENCODER_HALL_POLARITY_CALIBRATION
-            time.sleep(1)
-            while axis.current_state == odrive.enums.AXIS_STATE_ENCODER_HALL_POLARITY_CALIBRATION: time.sleep(0.5); print("  Hall cal running...")
-            if axis.encoder.error != 0 or axis.error != 0:
-                print(f"Error during Hall polarity calibration! Axis Error: {axis.error}, Encoder Error: {axis.encoder.error}"); odrive.dump_errors(odrv); return False
-            if not axis.encoder.config.hall_polarity_calibrated: print("Error: Hall polarity cal flag not set."); return False
-            print("  Hall polarity calibration successful.")
-        elif ENCODER_MODE in [odrive.enums.ENCODER_MODE_INCREMENTAL, odrive.enums.ENCODER_MODE_SPI_ABS_CUI]:
-             print("Requesting Encoder Offset Calibration...")
-             axis.encoder.config.pre_calibrated = False
-             axis.requested_state = odrive.enums.AXIS_STATE_ENCODER_OFFSET_CALIBRATION
-             time.sleep(1)
-             while axis.current_state == odrive.enums.AXIS_STATE_ENCODER_OFFSET_CALIBRATION: time.sleep(0.5); print("  Encoder offset cal running...")
-             if axis.encoder.error != 0 or axis.error != 0:
-                 print(f"Error during encoder offset calibration! Axis Error: {axis.error}, Encoder Error: {axis.encoder.error}"); odrive.dump_errors(odrv); return False
-             if not axis.encoder.config.pre_calibrated: print("Error: Encoder offset cal flag not set."); return False
-             print("  Encoder offset calibration successful.")
-        else: print(f"Encoder mode {ENCODER_MODE} needs no standard calibration here.")
-        # Set Ready
-        axis.requested_state = odrive.enums.AXIS_STATE_IDLE
-        print("Calibration sequence complete.")
-        return True
-    except Exception as e: print(f"Error during ODrive calibration: {e}"); return False
-
-# --- Data Reader Threads ---
-
-# def arduino_reader(ser): # Arduino dependency - commented out
-#    pass # Keep function defined maybe, but do nothing
-
+# --- Data Reader Threads (Unchanged) ---
 def odrive_reader(odrv):
     """Thread function to read data from ODrive and put it in a queue."""
-    # print("ODrive reader thread started.") # Reduce noise
     sample_period = 1.0 / SAMPLE_RATE_HZ; next_sample_time = time.time()
     while collection_active.is_set():
         current_time = time.time()
         if current_time >= next_sample_time:
             try:
-                if hasattr(odrv, 'axis0') and odrv.axis0:
-                    data = {'sys_time': current_time, 'voltage': odrv.vbus_voltage,
-                            'current_q': getattr(getattr(getattr(odrv.axis0, 'motor', {}), 'current_control', {}), 'Iq_measured', None),
-                            'current_d': getattr(getattr(getattr(odrv.axis0, 'motor', {}), 'current_control', {}), 'Id_measured', None),
-                            'velocity': getattr(getattr(odrv.axis0, 'encoder', {}), 'vel_estimate', None),
-                            'position': getattr(getattr(odrv.axis0, 'encoder', {}), 'pos_estimate', None),
-                            'temperature': getattr(getattr(getattr(odrv.axis0, 'motor', {}), 'fet_thermistor', {}), 'temperature', None),
-                            'axis_error': getattr(odrv.axis0, 'error', 0), 'motor_error': getattr(getattr(odrv.axis0, 'motor', {}), 'error', 0),
-                            'encoder_error': getattr(getattr(odrv.axis0, 'encoder', {}), 'error', 0)}
+                local_odrv_ref = odrv
+                if hasattr(local_odrv_ref, 'axis1') and local_odrv_ref.axis1:
+                    data = {'sys_time': current_time, 'voltage': local_odrv_ref.vbus_voltage,
+                            'current_q': getattr(getattr(getattr(local_odrv_ref.axis1, 'motor', {}), 'current_control', {}), 'Iq_measured', None),
+                            'current_d': getattr(getattr(getattr(local_odrv_ref.axis1, 'motor', {}), 'current_control', {}), 'Id_measured', None),
+                            'velocity': getattr(getattr(local_odrv_ref.axis1, 'encoder', {}), 'vel_estimate', None),
+                            'position': getattr(getattr(local_odrv_ref.axis1, 'encoder', {}), 'pos_estimate', None),
+                            'temperature': getattr(getattr(getattr(local_odrv_ref.axis1, 'motor', {}), 'fet_thermistor', {}), 'temperature', None),
+                            'axis_error': getattr(local_odrv_ref.axis1, 'error', 0),
+                            'motor_error': getattr(getattr(local_odrv_ref.axis1, 'motor', {}), 'error', 0),
+                            'encoder_error': getattr(getattr(local_odrv_ref.axis1, 'encoder', {}), 'error', 0)}
                     odrive_data_queue.put(data)
                 else: time.sleep(0.1)
-            except Exception as e: print(f"ODrive read error: {e}")
+            except Exception as e:
+                print(f"ODrive read error (connection might be lost): {e}")
+                time.sleep(0.5)
             next_sample_time += sample_period
             if next_sample_time < current_time: next_sample_time = current_time + sample_period
         else:
              sleep_time = next_sample_time - current_time - 0.001
              if sleep_time > 0: time.sleep(sleep_time)
-    # print("ODrive reader thread finished.") # Reduce noise
 
-
-# --- Data Processing (Modified for ODrive Only) ---
+# --- Data Processing (Unchanged) ---
 def merge_and_save_data(test_name):
     """Saves ODrive data ONLY to CSV."""
     print("Saving ODrive data...")
-
-    # Drain ODrive queue into list
     odrive_data = []
-    while not odrive_data_queue.empty():
-        odrive_data.append(odrive_data_queue.get_nowait())
-
+    while not odrive_data_queue.empty(): odrive_data.append(odrive_data_queue.get_nowait())
     print(f"Processing {len(odrive_data)} ODrive samples")
-    if not odrive_data:
-        print("No ODrive data collected to save.")
-        return
-
-    # Prepare CSV filename
+    if not odrive_data: print("No ODrive data collected."); return
+    
+    # Ensure data directory exists
+    if not os.path.exists("data"):
+        os.makedirs("data")
+    
     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = CSV_FILENAME_TEMPLATE.format(test_name=test_name, timestamp=timestamp_str)
-
-    # Define CSV headers - ODrive ONLY
-    fieldnames = ['timestamp', 'voltage', 'current_q', 'current_d', 'velocity',
-                  'position', 'temperature', 'axis_error', 'motor_error', 'encoder_error']
-
-    # Sort data by timestamp just in case
+    fieldnames = ['timestamp', 'voltage', 'current_q', 'current_d', 'velocity', 'position',
+                  'temperature', 'axis_error', 'motor_error', 'encoder_error']
     odrive_data.sort(key=lambda x: x['sys_time'])
-
-    # Rename 'sys_time' to 'timestamp' for CSV header consistency
-    for record in odrive_data:
-        record['timestamp'] = record.pop('sys_time')
-
-    # Write to CSV
+    for record in odrive_data: record['timestamp'] = record.pop('sys_time')
     try:
         with open(filename, 'w', newline='') as csvfile:
-            # Use only ODrive fieldnames
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows(odrive_data) # Write the processed ODrive data
-        print(f"ODrive data successfully saved to {filename}")
-    except IOError as e:
-        print(f"Error writing CSV {filename}: {e}")
-    except Exception as e:
-        print(f"Unexpected error writing CSV: {e}")
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore'); writer.writeheader(); writer.writerows(odrive_data)
+        print(f"Data successfully saved to {filename}")
+    except IOError as e: print(f"Error writing CSV {filename}: {e}")
+    except Exception as e: print(f"Unexpected error writing CSV: {e}")
 
-
-# --- Test Execution Function (Modified for ODrive Only) ---
-def run_distance_test(odrv, test_name, target_velocity_rps, loaded_radius_cm, target_distance_m=0.80):
+# --- Test Execution Function (Modified) ---
+def run_distance_test(odrv, test_name, target_velocity_rps, radius_cm, target_distance_m=0.80):
     """
     Runs a test using position control to travel a specific linear distance.
-    (Modified to not require arduino_ser)
+    Uses ODrive's built-in trajectory planning for proper acceleration/deceleration.
+    
+    Args:
+        odrv: ODrive object
+        test_name: Name for the test (used in data file)
+        target_velocity_rps: Target velocity in revolutions per second
+        radius_cm: Wheel radius in cm
+        target_distance_m: Target distance to travel in meters (default 0.80m)
+    
+    Returns:
+        True if test completed successfully, False otherwise
     """
-    global collection_active
-
-    if not odrv: # Check only for odrv
-        print(f"Skipping test '{test_name}': ODrive not connected.")
+    # Convert radius from cm to meters for calculations
+    radius_m = radius_cm / 100.0
+    
+    # Calculate circumference (in meters per revolution)
+    circumference_m = 2 * math.pi * radius_m
+    
+    # Calculate target revolutions based on wheel radius and distance
+    target_revolutions = target_distance_m / circumference_m
+    
+    # Access axis directly
+    if not hasattr(odrv, 'axis1'):
+        print("Error: ODrive Axis 1 not found.")
         return False
-
+    axis = odrv.axis1
+    
+    # Validate calibration
+    if not axis.motor.is_calibrated or not axis.encoder.is_ready:
+        print("Error: Motor/encoder not calibrated!")
+        print(f"Motor Calibrated: {axis.motor.is_calibrated}, Encoder Ready: {axis.encoder.is_ready}")
+        return False
+        
+    # Start position first...
+    start_pos_turns = axis.encoder.pos_estimate
+    target_end_pos = start_pos_turns + target_revolutions  # Add the revolutions (distance)
+    
+    # Make sure existing errors are cleared
+    if axis.error != 0:
+        print(f"Clearing Axis 1 error state: {axis.error}")
+        axis.error = 0
+        
+    # Print test parameters
     print(f"\n--- Starting Distance Test: {test_name} ---")
-    print(f"Target Dist: {target_distance_m*100:.0f} cm, Loaded Radius: {loaded_radius_cm:.2f} cm, Target Vel: {target_velocity_rps:.2f} turns/sec")
-
-    test_successful = False
-    axis = odrv.axis0
-    try:
-        # Calculations (Unchanged)
-        if loaded_radius_cm <= 0: print("Error: Loaded radius must be positive."); return False
-        loaded_radius_m = loaded_radius_cm / 100.0; circumference_m = 2 * math.pi * loaded_radius_m
-        if circumference_m <= 0: print("Error: Circumference calculation failed."); return False
-        target_revolutions = target_distance_m / circumference_m; target_pos_turns = target_revolutions
-        print(f"Calculated: Circumference={circumference_m:.3f} m, Target Revolutions={target_revolutions:.3f} turns")
-
-        # ODrive Configuration (Unchanged logic)
-        print("Configuring ODrive for position control...")
-        axis.requested_state = odrive.enums.AXIS_STATE_IDLE; time.sleep(0.1)
-        if axis.error != 0: print(f"Axis error {axis.error} detected. Clearing."); odrive.dump_errors(odrv, True); time.sleep(0.1)
-        if axis.error != 0: print("Failed to clear axis errors. Skipping."); return False
-        axis.controller.config.control_mode = odrive.enums.CONTROL_MODE_POSITION_CONTROL
-        axis.controller.config.input_mode = odrive.enums.INPUT_MODE_TRAP_TRAJ
-        effective_vel_limit = min(target_velocity_rps, axis.controller.config.vel_limit)
-        axis.trap_traj.config.vel_limit = effective_vel_limit
-        axis.trap_traj.config.accel_limit = TRAJ_ACCEL_LIMIT
-        axis.trap_traj.config.decel_limit = TRAJ_DECEL_LIMIT
-        print(f"Trajectory Limits: Vel={effective_vel_limit:.2f}, Accel={TRAJ_ACCEL_LIMIT:.2f}, Decel={TRAJ_DECEL_LIMIT:.2f}")
-
-        # Get Starting Position (Unchanged)
-        start_pos_turns = axis.encoder.pos_estimate; print(f"Starting Position: {start_pos_turns:.3f} turns")
-        final_target_pos_turns = start_pos_turns + target_pos_turns; print(f"Target Position: {final_target_pos_turns:.3f} turns")
-
-        # Start Data Collection (ODrive ONLY)
+    print(f"Target Dist: {target_distance_m*100:.0f} cm, Radius: {radius_cm:.2f} cm, Target Vel: {target_velocity_rps:.2f} turns/sec")
+    print(f"Calculated: Circumference={circumference_m:.3f} m, Target Revolutions={target_revolutions:.3f} turns")
+    
+    # Approximate time estimate (rough, not accounting for acceleration/deceleration)
+    estimated_time = target_revolutions / target_velocity_rps
+    print(f"Estimated move time: {estimated_time:.2f} seconds (approximate)")
+    
+    # Configure for position control with trajectory
+    print("Configuring ODrive for position control with trajectory planning...")
+    
+    # Keep track of current state (for comparison)
+    print("\n--- Current ODrive Configuration ---")
+    print(f"Control Mode: {axis.controller.config.control_mode}")
+    print(f"Input Mode: {axis.controller.config.input_mode}")
+    print(f"Starting Position: {start_pos_turns:.3f} turns")
+    print(f"Target Position: {target_end_pos:.3f} turns")
+    
+    # Configure controller for proper POSITION control with trajectory planning
+    axis.controller.config.control_mode = odrive.enums.CONTROL_MODE_POSITION_CONTROL
+    axis.controller.config.input_mode = odrive.enums.INPUT_MODE_TRAP_TRAJ  # Critical for proper trajectory
+    print(f"Set control mode to POSITION_CONTROL with TRAP_TRAJ input mode")
+    
+    # Get configuration parameters (without verbose comparison)
+    existing_vel_limit = axis.trap_traj.config.vel_limit
+    existing_accel_limit = axis.trap_traj.config.accel_limit
+    existing_decel_limit = axis.trap_traj.config.decel_limit
+    
+    # Only update velocity limit if the existing one is too low for our target
+    if existing_vel_limit < target_velocity_rps:
+        print(f"Setting velocity limit to match target: {target_velocity_rps:.2f} turns/sec")
+        axis.trap_traj.config.vel_limit = target_velocity_rps
+    else:
+        print(f"Using velocity limit: {existing_vel_limit:.2f} turns/sec")
+        
+    # Use whichever is smaller: the target velocity or the configured limit
+    effective_velocity = min(target_velocity_rps, axis.trap_traj.config.vel_limit)
+    
+    # Re-estimate move time based on the effective velocity and acceleration limits
+    estimated_move_time = target_revolutions / effective_velocity + effective_velocity / existing_accel_limit
+    print(f"Estimated move time: {estimated_move_time:.2f} seconds (using configured limits)")
+    
+    # Create a thread lock to prevent multiple executions
+    movement_lock = threading.Lock()
+    
+    # Make sure collection is not active from previous tests
+    collection_active.clear()
+    
+    # Acquire lock before starting the movement sequence
+    with movement_lock:
+        # Start Data Collection
         print("Starting ODrive data collection thread...")
         collection_active.set()
-        # arduino_thread = threading.Thread(target=arduino_reader, args=(arduino_ser,), daemon=True) # Arduino dependency - commented out
         odrive_thread = threading.Thread(target=odrive_reader, args=(odrv,), daemon=True)
-        # arduino_thread.start() # Arduino dependency - commented out
         odrive_thread.start()
         time.sleep(0.1)
-
-        # Command the Move (Unchanged)
-        print("Commanding position move...")
-        axis.controller.input_pos = final_target_pos_turns
-        axis.requested_state = odrive.enums.AXIS_STATE_CLOSED_LOOP_CONTROL; time.sleep(0.1)
+        
+        # First enable closed loop control
+        print("\n--- Initiating Movement ---")
+        axis.requested_state = odrive.enums.AXIS_STATE_CLOSED_LOOP_CONTROL
+        print("Enabling closed loop control...")
+        time.sleep(0.2)
+        
         if axis.current_state != odrive.enums.AXIS_STATE_CLOSED_LOOP_CONTROL:
-            print(f"Error: Axis failed to enter closed loop. State: {axis.current_state}"); odrive.dump_errors(odrv); collection_active.clear(); return False
-
-        # Wait for Move Completion (Unchanged logic)
+            print(f"Error: Failed to enter closed loop control. Current state: {axis.current_state}")
+            dump_errors(odrv)
+            collection_active.clear()
+            return False
+        
+        # THEN set position command to start movement
+        print(f"Commanding position move to {target_end_pos:.3f} turns...")
+        axis.controller.input_pos = target_end_pos
+        
+        # Wait for move to complete
         print("Waiting for trajectory completion...")
-        start_wait_time = time.time()
-        max_time_estimate = abs(target_pos_turns / effective_vel_limit) + (effective_vel_limit / TRAJ_ACCEL_LIMIT) + (effective_vel_limit / TRAJ_DECEL_LIMIT) + 5.0
-        print(f"Estimated max move time: {max_time_estimate:.2f}s"); wait_timeout = max(10.0, max_time_estimate)
+        start_time = time.time()
         move_complete = False
-        while time.time() - start_wait_time < wait_timeout:
-            if axis.controller.trajectory_done: move_complete = True; print("Trajectory done flag detected."); break
-            if axis.error != 0: print(f"Axis error {axis.error} during move! Stopping."); odrive.dump_errors(odrv); break
+        
+        # Maximum wait time is estimated time plus 50% margin
+        timeout = estimated_move_time * 1.5
+        
+        # Monitor the movement
+        while time.time() - start_time < timeout:
+            current_pos = axis.encoder.pos_estimate
+            current_velocity = axis.encoder.vel_estimate
+            position_error = abs(current_pos - target_end_pos)
+            distance_traveled = abs(current_pos - start_pos_turns)
+            elapsed = time.time() - start_time
+            
+            # Check for errors during move
+            if axis.error != 0:
+                print(f"\nAxis error {axis.error} during move! Stopping.") 
+                dump_errors(odrv)
+                break
+                
+            # Check if we've reached target position (within tolerance)
+            if position_error < 0.05 and abs(current_velocity) < 0.1:  # Within 0.05 turns and nearly stopped
+                print(f"\nReached target position at {current_pos:.3f} turns")
+                move_complete = True
+                break
+                
+            # Print status every 0.5 seconds, overwriting previous line
+            if elapsed % 0.5 < 0.1:
+                progress = (distance_traveled / target_revolutions) * 100
+                remaining = max(0, estimated_move_time - elapsed)
+                print(f"\rTime: {elapsed:.1f}/{estimated_move_time:.1f}s Pos: {current_pos:.3f} Vel: {current_velocity:.2f} Dist: {distance_traveled:.3f}/{target_revolutions:.3f} Progress: {progress:.1f}%", end="")
+                
             time.sleep(0.1)
-        if not move_complete: print("Warning: Move did not complete within timeout or error occurred.")
-        if axis.error != 0 and not move_complete: odrive.dump_errors(odrv) # Dump errors if move failed due to error
-
-        # Stop Data Collection (Unchanged logic)
-        print("Stopping data collection..."); collection_active.clear(); time.sleep(0.5); print("Data collection complete!")
-
-        # Stop Motor (Unchanged logic)
-        print("Setting ODrive to IDLE state..."); axis.requested_state = odrive.enums.AXIS_STATE_IDLE
-        axis.controller.input_pos = axis.encoder.pos_estimate; time.sleep(0.5); print("Motor stopped.")
-
-        # Process and Save Data (Calls modified function)
-        merge_and_save_data(test_name)
-        test_successful = True
-
+            
+        print("")  # New line after progress reporting
+        
+        # Final position report
+        final_pos = axis.encoder.pos_estimate
+        final_distance = abs(final_pos - start_pos_turns)
+        print(f"\nMove complete. Final position: {final_pos:.3f} turns")
+        print(f"Distance traveled: {final_distance:.3f} turns of {target_revolutions:.3f} target")
+        
+        # Check for tolerance
+        distance_error_pct = abs(final_distance - target_revolutions) / target_revolutions * 100
+        if distance_error_pct <= 10.0:  # Within 10% of target
+            print(f"Successfully reached target position (within 10% tolerance)")
+        else:
+            print(f"Warning: Final position error of {distance_error_pct:.1f}% exceeds 10% tolerance")
+    
+    # Always stop data collection and return motor to IDLE
+    print("Stopping data collection...")
+    collection_active.clear()
+    time.sleep(0.2)  # Make sure data collection thread completes
+    print("Data collection complete!")
+    
+    print("Setting ODrive to IDLE state...")
+    try:
+        axis.requested_state = odrive.enums.AXIS_STATE_IDLE
+        print("Motor stopped.")
     except Exception as e:
-        print(f"Error during distance test '{test_name}': {e}")
-        try:
-            if odrv and hasattr(odrv, 'axis0'): odrv.axis0.requested_state = odrive.enums.AXIS_STATE_IDLE
-        except Exception as cleanup_e: print(f"Error during emergency cleanup: {cleanup_e}")
-    finally:
-         collection_active.clear()
-         try:
-             if odrv and hasattr(odrv, 'axis0') and odrv.axis0.current_state != odrive.enums.AXIS_STATE_IDLE:
-                  print("Ensuring ODrive is idle post-test."); odrv.axis0.requested_state = odrive.enums.AXIS_STATE_IDLE
-         except Exception as final_cleanup_e: print(f"Error during final ODrive cleanup: {final_cleanup_e}")
+        print(f"Error setting ODrive to IDLE: {e}")
+    
+    # Save the data using the helper function
+    merge_and_save_data(test_name)
+    
+    return True
 
-    return test_successful
-
-
-# --- Main Execution Logic (Modified for ODrive Only) ---
+# --- Main Execution Logic (Using Step-by-Step Calibration) ---
 def main():
     """Main function to connect, configure, calibrate, run ODrive tests, and cleanup."""
     odrv = None
-    # arduino_ser = None # Arduino dependency - commented out
     try:
         # Connect to ODrive ONLY
         odrv = connect_to_odrive()
-        # arduino_ser = connect_to_arduino(ARDUINO_PORT, ARDUINO_BAUD) # Arduino dependency - commented out
+        if not odrv: print("Failed to connect to ODrive device. Exiting."); return
 
-        if not odrv: # Check only odrv
-            print("Failed to connect to ODrive device. Exiting.")
-            return
+        # Clear all errors at the start
+        clear_all_odrive_errors(odrv)
 
-        # Configure ODrive Parameters (Unchanged)
-        if not configure_odrive_parameters(odrv): print("ODrive parameter configuration failed. Exiting."); return
-
-        # Run ODrive Calibration (Unchanged)
-        print("\n*** WARNING: ODrive calibration will spin the motor briefly. ***"); print("*** Ensure the wheel is free to rotate without obstruction. ***")
+        # --- Run ODrive Calibration (Using step-by-step function) ---
+        print("\n*** WARNING: ODrive calibration will spin the motor. ***"); print("*** Ensure the wheel is free to rotate without obstruction. ***")
         input("Press Enter to start calibration...")
-        if not run_odrive_calibration(odrv): print("ODrive calibration failed. Exiting."); odrive.dump_errors(odrv); return
+        if not run_odrive_calibration(odrv): # Calls the step-by-step function
+             print("ODrive calibration failed. Exiting.")
+             # dump_errors called inside function on failure
+             return
         print("Calibration successful.")
 
-        # Save Configuration (Unchanged)
-        print("Saving ODrive configuration...");
-        try: odrv.save_configuration(); print("Configuration saved.")
-        except Exception as e: print(f"Error saving configuration: {e}")
+        # Ensure data directory exists
+        if not os.path.exists("data"):
+            os.makedirs("data")
+            print("Created data directory for test results.")
 
-        # Run Interactive Distance Tests (Modified to call updated function)
+        # Run Interactive Distance Tests
         print("\n--- Starting Interactive Distance Test Sequence (ODrive Only) ---")
         while True:
+            # Check connection at start of loop
+            print("\nVerifying ODrive connection before next test...")
+            try:
+                _ = odrv.vbus_voltage # Read a value to check connection
+                # Check calibration status before allowing test start
+                if not odrv.axis1.motor.is_calibrated or not odrv.axis1.encoder.is_ready:
+                     print("Error: ODrive reports axis1 is not calibrated at start of test loop. Exiting.")
+                     break # Exit loop if not calibrated
+                print("Connection OK and Axis 1 calibrated.")
+            except Exception as loop_conn_err:
+                print(f"ODrive connection lost ({loop_conn_err}). Attempting reconnect...")
+                odrv = connect_to_odrive()
+                if not odrv:
+                    print("Reconnection failed. Cannot continue tests. Exiting.")
+                    break # Exit the while loop
+                print("Reconnected successfully.")
+                # Re-check calibration after reconnect
+                if not odrv.axis1.motor.is_calibrated or not odrv.axis1.encoder.is_ready:
+                     print("Error: ODrive reports axis1 is not calibrated after reconnect. Exiting.")
+                     break
+
+
             print("\nEnter test parameters (or type 'quit' for test name to exit):")
             test_name = input("Enter a unique name for this test run: ")
             if test_name.lower() == 'quit': break
             try:
-                target_velocity_str = input(f"Enter target velocity during move (turns/sec, e.g., 1.0, max {VEL_LIMIT}): ")
+                target_velocity_str = input(f"Enter target velocity during move (turns/sec, e.g., 1.0): ")
                 target_velocity_rps = float(target_velocity_str)
-                if target_velocity_rps <= 0 or target_velocity_rps > VEL_LIMIT: print(f"Invalid velocity. Must be > 0 and <= {VEL_LIMIT}."); continue
-                loaded_radius_str = input("Enter current LOADED wheel radius (cm): ")
-                loaded_radius_cm = float(loaded_radius_str)
-                if loaded_radius_cm <= 0: print("Invalid radius. Must be positive."); continue
+                if target_velocity_rps <= 0: print(f"Invalid velocity. Must be > 0."); continue
+
+                radius_str = input("Enter wheel radius (cm): ")
+                radius_cm = float(radius_str)
+                if radius_cm <= 0: print("Invalid radius. Must be positive."); continue
+
                 print("\n*** Ensure the correct vertical load is applied to the wheel! ***")
                 input("Press Enter when ready to start the test...")
-                # Call the test function WITHOUT arduino_ser
-                run_distance_test(odrv, test_name, target_velocity_rps, loaded_radius_cm)
+
+                # Call the test function using axis1
+                run_distance_test(odrv, test_name, target_velocity_rps, radius_cm)
+
             except ValueError: print("Invalid input. Please enter numbers.")
-            except Exception as e: print(f"An error occurred setting up test: {e}")
+            except Exception as e: print(f"An error occurred setting up or running test: {e}")
+
         print("\n--- Test Sequence Finished ---")
 
     except KeyboardInterrupt: print("\nProgram interrupted by user"); collection_active.clear()
     except Exception as e: print(f"An critical error occurred in the main program: {e}"); collection_active.clear()
     finally:
-        # Cleanup (ODrive ONLY)
+        # Cleanup
         print("Cleaning up resources..."); collection_active.clear(); time.sleep(0.5)
-        if odrv and hasattr(odrv, 'axis0'):
-            try: print("Setting ODrive to IDLE state."); odrv.axis0.requested_state = odrive.enums.AXIS_STATE_IDLE
-            except Exception as e: print(f"Error idling ODrive: {e}")
-        # if arduino_ser and arduino_ser.is_open: # Arduino dependency - commented out
-        #     try: print("Closing Arduino connection."); arduino_ser.close()
-        #     except Exception as e: print(f"Error closing serial: {e}")
+        try:
+            if odrv and hasattr(odrv, 'axis1'):
+                print("Setting ODrive Axis 1 to IDLE state.")
+                odrv.axis1.requested_state = odrive.enums.AXIS_STATE_IDLE
+        except Exception as e: print(f"Error idling ODrive Axis 1 during cleanup: {e}")
         print("Program finished.")
+
 
 if __name__ == "__main__":
     main()
