@@ -60,38 +60,67 @@ def align_data(odrive_data, arduino_data):
         result = arduino_data.copy()
         result['source'] = 'arduino'
         return result
-        
-    if len(arduino_data) == 0:
-        print("No Arduino data found - using ODrive data only")
+    
+    if len(arduino_data) == 0 or arduino_data.isnull().all().all():
+        print("No valid Arduino data found - using ODrive data only")
         result = odrive_data.copy()
         result['source'] = 'odrive'
         return result
     
-    # Ensure timestamps are sorted
-    odrive_data = odrive_data.sort_values('timestamp')
-    arduino_data = arduino_data.sort_values('timestamp')
+    # Ensure timestamps are properly formatted as floats
+    try:
+        odrive_data['timestamp'] = odrive_data['timestamp'].astype(float)
+    except (ValueError, TypeError):
+        print("Warning: ODrive timestamps not numeric - using sequential values")
+        odrive_data['timestamp'] = np.arange(len(odrive_data))
     
-    # Check if ODrive data has any valid numeric columns
-    odrive_numeric_cols = odrive_data.select_dtypes(include=['number']).columns
-    odrive_has_data = False
-    for col in odrive_numeric_cols:
-        if col != 'timestamp' and not odrive_data[col].isnull().all():
-            odrive_has_data = True
-            break
+    try:
+        arduino_data['timestamp'] = arduino_data['timestamp'].astype(float)
+    except (ValueError, TypeError):
+        print("Warning: Arduino timestamps not numeric - using sequential values")
+        arduino_data['timestamp'] = np.arange(len(arduino_data))
     
-    if not odrive_has_data:
-        print("ODrive data has timestamps but no actual values - using Arduino data only")
-        result = arduino_data.copy()
-        result['source'] = 'arduino'
-        return result
+    # Determine the common time range
+    min_timestamp = max(
+        odrive_data['timestamp'].min() if not odrive_data.empty else float('inf'),
+        arduino_data['timestamp'].min() if not arduino_data.empty else float('inf')
+    )
     
-    # Create a new DataFrame with a regular time grid spanning both datasets
-    min_time = min(odrive_data['timestamp'].min(), arduino_data['timestamp'].min())
-    max_time = max(odrive_data['timestamp'].max(), arduino_data['timestamp'].max())
+    max_timestamp = min(
+        odrive_data['timestamp'].max() if not odrive_data.empty else float('-inf'),
+        arduino_data['timestamp'].max() if not arduino_data.empty else float('-inf')
+    )
     
-    # Create time points with 10ms resolution
-    time_points = np.arange(min_time, max_time, 0.01)
-    time_grid = pd.DataFrame({'timestamp': time_points})
+    # Safeguard against invalid time ranges
+    if min_timestamp >= max_timestamp:
+        print("Warning: Data sources have non-overlapping timestamps")
+        print(f"ODrive timestamps: {odrive_data['timestamp'].min()} to {odrive_data['timestamp'].max()}")
+        print(f"Arduino timestamps: {arduino_data['timestamp'].min()} to {arduino_data['timestamp'].max()}")
+        
+        # Create a unified time scale for non-overlapping data
+        all_timestamps = np.concatenate([
+            odrive_data['timestamp'].values,
+            arduino_data['timestamp'].values
+        ])
+        min_timestamp = all_timestamps.min()
+        max_timestamp = all_timestamps.max()
+        print(f"Using combined timestamp range: {min_timestamp} to {max_timestamp}")
+    
+    # Create a regular time grid for interpolation (100 points or actual sample count, whichever is larger)
+    grid_points = max(100, len(odrive_data) + len(arduino_data))
+    try:
+        time_points = np.linspace(min_timestamp, max_timestamp, grid_points)
+    except Exception as e:
+        print(f"Error creating time points: {e}")
+        # Fallback option: create sequential timestamps
+        time_points = np.arange(grid_points)
+        # Update the original dataframes with these sequential timestamps
+        if len(odrive_data) > 0:
+            odrive_idx = np.round(np.linspace(0, grid_points-1, len(odrive_data))).astype(int)
+            odrive_data['timestamp'] = time_points[odrive_idx]
+        if len(arduino_data) > 0:
+            arduino_idx = np.round(np.linspace(0, grid_points-1, len(arduino_data))).astype(int)
+            arduino_data['timestamp'] = time_points[arduino_idx]
     
     # Interpolate ODrive data onto the time grid
     odrive_numeric = odrive_data.select_dtypes(include=['number'])
@@ -100,13 +129,18 @@ def align_data(odrive_data, arduino_data):
     
     for col in odrive_numeric.columns:
         if col != 'timestamp' and col in odrive_data.columns and not odrive_data[col].isnull().all():
-            # Use linear interpolation for ODrive data
-            odrive_interp[col] = np.interp(
-                time_points, 
-                odrive_data['timestamp'],
-                odrive_data[col].fillna(0),  # Fill NaN with zeros for interpolation
-                left=np.nan, right=np.nan
-            )
+            try:
+                # Use linear interpolation for ODrive data
+                odrive_interp[col] = np.interp(
+                    time_points, 
+                    odrive_data['timestamp'],
+                    odrive_data[col].fillna(0),  # Fill NaN with zeros for interpolation
+                    left=np.nan, right=np.nan
+                )
+            except Exception as e:
+                print(f"Error interpolating ODrive column {col}: {e}")
+                # Skip this column
+                continue
     
     # Interpolate Arduino data onto the time grid
     arduino_numeric = arduino_data.select_dtypes(include=['number'])
@@ -115,13 +149,18 @@ def align_data(odrive_data, arduino_data):
     
     for col in arduino_numeric.columns:
         if col != 'timestamp' and col in arduino_data.columns and not arduino_data[col].isnull().all():
-            # Use linear interpolation for Arduino data
-            arduino_interp[col] = np.interp(
-                time_points, 
-                arduino_data['timestamp'],
-                arduino_data[col].fillna(0),  # Fill NaN with zeros for interpolation
-                left=np.nan, right=np.nan
-            )
+            try:
+                # Use linear interpolation for Arduino data
+                arduino_interp[col] = np.interp(
+                    time_points, 
+                    arduino_data['timestamp'],
+                    arduino_data[col].fillna(0),  # Fill NaN with zeros for interpolation
+                    left=np.nan, right=np.nan
+                )
+            except Exception as e:
+                print(f"Error interpolating Arduino column {col}: {e}")
+                # Skip this column
+                continue
     
     # Merge the interpolated datasets
     aligned_df = pd.merge(odrive_interp, arduino_interp, on='timestamp', how='outer', suffixes=('_odrive', '_arduino'))
@@ -129,10 +168,8 @@ def align_data(odrive_data, arduino_data):
     # Fill non-numeric columns
     aligned_df['source'] = 'combined'
     
-    # Keep only rows where at least some Arduino data is available
-    required_columns = [col for col in ['ax', 'ay', 'az', 'roll', 'pitch', 'yaw'] if col in aligned_df.columns]
-    if required_columns:
-        aligned_df = aligned_df.dropna(subset=required_columns, how='all')
+    # Keep only rows where at least some data is available
+    aligned_df = aligned_df.dropna(how='all')
     
     print(f"Created aligned dataset with {len(aligned_df)} records")
     
@@ -265,12 +302,6 @@ def process_file(filepath):
             with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
                 # Add the main processed data
                 aligned_df.to_excel(writer, sheet_name='Processed Data', index=False)
-                
-                # Add the original data sheets if they exist
-                if len(odrive_data) > 0:
-                    odrive_data.to_excel(writer, sheet_name='ODrive Raw Data', index=False)
-                if len(arduino_data) > 0:
-                    arduino_data.to_excel(writer, sheet_name='Arduino Raw Data', index=False)
                 
                 # Add a summary sheet with useful test metrics
                 summary_data = {

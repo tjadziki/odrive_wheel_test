@@ -12,6 +12,8 @@ import json
 import queue # Using queue for thread-safe communication
 import math
 import os
+import atexit
+import signal
 
 # --- Configuration ---
 ARDUINO_PORT = 'COM7'  # Arduino dependency - adjust as needed
@@ -116,14 +118,20 @@ def run_odrive_calibration(odrv):
 # --- Data Reader Threads (Unchanged) ---
 def odrive_reader(odrv):
     """Thread function to read data from ODrive and put it in a queue."""
-    sample_period = 1.0 / SAMPLE_RATE_HZ; next_sample_time = time.time()
+    sample_period = 1.0 / SAMPLE_RATE_HZ
+    next_sample_time = time.time()
+    # Record the start time to make timestamps relative to test start (starting at 0)
+    start_time = next_sample_time
+    
     while collection_active.is_set():
         current_time = time.time()
         if current_time >= next_sample_time:
             try:
                 local_odrv_ref = odrv
                 if hasattr(local_odrv_ref, 'axis1') and local_odrv_ref.axis1:
-                    data = {'sys_time': current_time, 'voltage': local_odrv_ref.vbus_voltage,
+                    # Use timestamp instead of sys_time and make it relative to test start
+                    data = {'timestamp': current_time - start_time, 
+                            'voltage': local_odrv_ref.vbus_voltage,
                             'current_q': getattr(getattr(getattr(local_odrv_ref.axis1, 'motor', {}), 'current_control', {}), 'Iq_measured', None),
                             'current_d': getattr(getattr(getattr(local_odrv_ref.axis1, 'motor', {}), 'current_control', {}), 'Id_measured', None),
                             'velocity': getattr(getattr(local_odrv_ref.axis1, 'encoder', {}), 'vel_estimate', None),
@@ -152,21 +160,43 @@ def arduino_reader(arduino_port, arduino_baud):
         try:
             arduino_ser.close()
             print("Closed existing Arduino connection")
-        except:
-            pass
+            # Add a small delay to ensure the port is released
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Error closing existing Arduino connection: {e}")
         arduino_ser = None
     
+    # Retry connection up to 3 times
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            # Create a fresh connection for each test
+            print(f"Opening Arduino serial port {arduino_port} at {arduino_baud} baud...")
+            arduino_ser = serial.Serial(arduino_port, arduino_baud, timeout=0.1)
+            print(f"Arduino serial port opened successfully")
+            arduino_ser.flushInput()
+            break  # Connection successful, exit retry loop
+        except serial.SerialException as e:
+            retry_count += 1
+            if retry_count < max_retries:
+                print(f"Failed to open Arduino port (attempt {retry_count}/{max_retries}): {e}")
+                print("Retrying in 2 seconds...")
+                time.sleep(2)  # Wait before retrying
+            else:
+                print(f"ERROR: Could not open Arduino serial port {arduino_port}: {e}")
+                print("Check Arduino connection and COM port settings")
+                return  # Exit if we can't connect after retries
+    
     try:
-        # Create a fresh connection for each test
-        print(f"Opening Arduino serial port {arduino_port} at {arduino_baud} baud...")
-        arduino_ser = serial.Serial(arduino_port, arduino_baud, timeout=0.1)  # Reduced timeout for faster response
-        print(f"Arduino serial port opened successfully")
-        arduino_ser.flushInput()
-        
         # Try reading some initial data to verify connection
         print("Checking Arduino data...")
         initial_check_time = time.time()
         initial_data_found = False
+        
+        # Record the start time to make timestamps relative to test start (starting at 0)
+        start_time = initial_check_time
         
         # Try for up to 1 second to get initial data
         while time.time() - initial_check_time < 1.0 and not initial_data_found:
@@ -197,14 +227,29 @@ def arduino_reader(arduino_port, arduino_baud):
                     
                     # Try to decode it
                     if raw_data:
-                        data = raw_data.decode('utf-8').strip()
-                        if data:
+                        data_str = raw_data.decode('utf-8').strip()
+                        if data_str:
                             # Debug: print first few samples
                             if data_count < 5:
-                                print(f"Arduino data sample {data_count+1}: {data[:50]}...")
+                                print(f"Arduino data sample {data_count+1}: {data_str[:50]}...")
                             
+                            # Add timestamp to the data
+                            try:
+                                # Try to parse the JSON data
+                                data_json = json.loads(data_str)
+                                
+                                # Add host system timestamp (relative to test start)
+                                current_time = time.time()
+                                data_json['host_timestamp'] = current_time - start_time
+                                
+                                # Convert back to JSON string
+                                data_str = json.dumps(data_json)
+                            except json.JSONDecodeError:
+                                # If data is not valid JSON, just pass it through as-is
+                                pass
+                                
                             # Add to queue
-                            arduino_data_queue.put(data)
+                            arduino_data_queue.put(data_str)
                             data_count += 1
                             empty_read_count = 0
                             
@@ -279,7 +324,8 @@ def merge_and_save_data(test_name):
     odrive_fields = ['timestamp', 'voltage', 'current_q', 'current_d', 'velocity', 'position',
                      'temperature', 'axis_error', 'motor_error', 'encoder_error']
     
-    arduino_fields = ['ts', 'ax', 'ay', 'az', 'gx', 'gy', 'gz', 'roll', 'pitch', 'yaw', 'source']
+    # Add host_timestamp to Arduino fields
+    arduino_fields = ['ts', 'host_timestamp', 'ax', 'ay', 'az', 'gx', 'gy', 'gz', 'roll', 'pitch', 'yaw', 'source']
     
     # Build a merged dataset
     merged_data = []
@@ -299,9 +345,14 @@ def merge_and_save_data(test_name):
         for field in arduino_fields:
             if field in item:
                 record[field] = item[field]
-        # Convert Arduino timestamp to match format if needed
-        if 'ts' in item:
+        
+        # Use host_timestamp as the primary timestamp for alignment if available
+        if 'host_timestamp' in item:
+            record['timestamp'] = item['host_timestamp']
+        # Fallback to Arduino's own timestamp if host_timestamp is not available
+        elif 'ts' in item:
             record['timestamp'] = item['ts'] / 1000.0  # Convert ms to seconds
+        
         merged_data.append(record)
     
     # Sort the merged data by timestamp
@@ -419,108 +470,261 @@ def run_distance_test(odrv, test_name, target_velocity_rps, radius_cm, target_di
     # Ensure any existing threads are stopped
     time.sleep(0.2)
     
-    # Acquire lock before starting the movement sequence
-    with run_distance_test.movement_lock:
-        # Start Data Collection
-        print("Starting ODrive data collection thread...")
-        collection_active.set()
-        odrive_thread = threading.Thread(target=odrive_reader, args=(odrv,), daemon=True)
-        odrive_thread.start()
-        time.sleep(0.1)
-        
-        # Start Arduino data collection thread
-        print("Starting Arduino data collection thread...")
-        arduino_thread = threading.Thread(target=arduino_reader, args=(ARDUINO_PORT, ARDUINO_BAUD), daemon=True)
-        arduino_thread.start()
-        time.sleep(0.1)
-        
-        # Wait for both threads to start
-        time.sleep(0.5)
-        
-        # First enable closed loop control
-        print("\n--- Initiating Movement ---")
-        axis.requested_state = odrive.enums.AXIS_STATE_CLOSED_LOOP_CONTROL
-        print("Enabling closed loop control...")
-        time.sleep(0.2)
-        
-        if axis.current_state != odrive.enums.AXIS_STATE_CLOSED_LOOP_CONTROL:
-            print(f"Error: Failed to enter closed loop control. Current state: {axis.current_state}")
-            dump_errors(odrv)
-            collection_active.clear()
-            return False
-        
-        # THEN set position command to start movement
-        print(f"Commanding position move to {target_end_pos:.3f} turns...")
-        axis.controller.input_pos = target_end_pos
-        
-        # Wait for move to complete
-        print("Waiting for trajectory completion...")
-        start_time = time.time()
-        move_complete = False
-        
-        # Maximum wait time is estimated time plus 50% margin
-        timeout = estimated_move_time * 1.5
-        
-        # Monitor the movement
-        while time.time() - start_time < timeout:
-            current_pos = axis.encoder.pos_estimate
-            current_velocity = axis.encoder.vel_estimate
-            position_error = abs(current_pos - target_end_pos)
-            distance_traveled = abs(current_pos - start_pos_turns)
-            elapsed = time.time() - start_time
-            
-            # Check for errors during move
-            if axis.error != 0:
-                print(f"\nAxis error {axis.error} during move! Stopping.") 
-                dump_errors(odrv)
-                break
-                
-            # Check if we've reached target position (within tolerance)
-            if position_error < 0.05 and abs(current_velocity) < 0.1:  # Within 0.05 turns and nearly stopped
-                print(f"\nReached target position at {current_pos:.3f} turns")
-                move_complete = True
-                break
-                
-            # Print status every 0.5 seconds, overwriting previous line
-            if elapsed % 0.5 < 0.1:
-                progress = (distance_traveled / target_revolutions) * 100
-                remaining = max(0, estimated_move_time - elapsed)
-                print(f"\rTime: {elapsed:.1f}/{estimated_move_time:.1f}s Pos: {current_pos:.3f} Vel: {current_velocity:.2f} Dist: {distance_traveled:.3f}/{target_revolutions:.3f} Progress: {progress:.1f}%", end="")
-                
+    try:
+        # Acquire lock before starting the movement sequence
+        with run_distance_test.movement_lock:
+            # Start Data Collection
+            print("Starting ODrive data collection thread...")
+            collection_active.set()
+            odrive_thread = threading.Thread(target=odrive_reader, args=(odrv,), daemon=True)
+            odrive_thread.start()
             time.sleep(0.1)
             
-        print("")  # New line after progress reporting
-        
-        # Final position report
-        final_pos = axis.encoder.pos_estimate
-        final_distance = abs(final_pos - start_pos_turns)
-        print(f"\nMove complete. Final position: {final_pos:.3f} turns")
-        print(f"Distance traveled: {final_distance:.3f} turns of {target_revolutions:.3f} target")
-        
-        # Check for tolerance
-        distance_error_pct = abs(final_distance - target_revolutions) / target_revolutions * 100
-        if distance_error_pct <= 10.0:  # Within 10% of target
-            print(f"Successfully reached target position (within 10% tolerance)")
-        else:
-            print(f"Warning: Final position error of {distance_error_pct:.1f}% exceeds 10% tolerance")
-    
-    # Always stop data collection and return motor to IDLE
-    print("Stopping data collection...")
-    collection_active.clear()
-    time.sleep(0.2)  # Make sure data collection thread completes
-    print("Data collection complete!")
-    
-    print("Setting ODrive to IDLE state...")
-    try:
-        axis.requested_state = odrive.enums.AXIS_STATE_IDLE
-        print("Motor stopped.")
+            # Start Arduino data collection thread
+            print("Starting Arduino data collection thread...")
+            arduino_thread = threading.Thread(target=arduino_reader, args=(ARDUINO_PORT, ARDUINO_BAUD), daemon=True)
+            arduino_thread.start()
+            time.sleep(0.1)
+            
+            # Wait for both threads to start
+            time.sleep(0.5)
+            
+            # First enable closed loop control
+            print("\n--- Initiating Movement ---")
+            axis.requested_state = odrive.enums.AXIS_STATE_CLOSED_LOOP_CONTROL
+            print("Enabling closed loop control...")
+            time.sleep(0.2)
+            
+            if axis.current_state != odrive.enums.AXIS_STATE_CLOSED_LOOP_CONTROL:
+                print(f"Error: Failed to enter closed loop control. Current state: {axis.current_state}")
+                dump_errors(odrv)
+                collection_active.clear()
+                return False
+            
+            # Now command the position move
+            print(f"Commanding position move to {target_end_pos:.3f} turns...")
+            axis.controller.input_pos = target_end_pos
+            
+            # Wait for position move to complete
+            print("Waiting for trajectory completion...")
+            
+            # Better progress tracking with timeout
+            start_time = time.time()
+            timeout = estimated_move_time * 3  # Triple the estimated time
+            
+            max_deviation = target_revolutions * 0.10  # 10% tolerance
+            
+            # Sample some points along the way (for feedback)
+            last_update = time.time()
+            update_interval = 0.5  # in seconds
+            
+            while time.time() - start_time < timeout:
+                current_pos = axis.encoder.pos_estimate
+                current_vel = axis.encoder.vel_estimate
+                distance_traveled = abs(current_pos - start_pos_turns)
+                progress = min(100.0, (distance_traveled / target_revolutions) * 100)
+                
+                # Check every half second
+                if time.time() - last_update >= update_interval:
+                    elapsed = time.time() - start_time
+                    print(f"\rTime: {elapsed:.1f}/{timeout:.1f}s Pos: {current_pos:.3f} Vel: {current_vel:.2f} Dist: {distance_traveled:.3f}/{target_revolutions:.3f} Progress: {progress:.1f}%", end="")
+                    last_update = time.time()
+                
+                # Consider the move complete if we're at the target position or close to it
+                pos_error = abs(current_pos - target_end_pos)
+                if pos_error < max_deviation and abs(current_vel) < 0.1:
+                    print(f"\nReached target position at {current_pos:.3f} turns")
+                    break
+                
+                time.sleep(0.01)
+            
+            # Final newline
+            print("\n")
+            
+            # Check if we reached the target position
+            current_pos = axis.encoder.pos_estimate
+            distance_traveled = abs(current_pos - start_pos_turns)
+            pos_error = abs(current_pos - target_end_pos)
+            
+            print(f"Move complete. Final position: {current_pos:.3f} turns")
+            print(f"Distance traveled: {distance_traveled:.3f} turns of {target_revolutions:.3f} target")
+            
+            # Succeeded if we got within 10% of the target (or better)
+            if pos_error < max_deviation:
+                print("Successfully reached target position (within 10% tolerance)")
+                result = True
+            else:
+                print(f"Failed to reach target position. Error: {pos_error:.3f} turns")
+                result = False
+            
+            # Cleanup (for safety and consistent future testing)
+            print("Stopping data collection...")
+            collection_active.clear()
+            time.sleep(0.5)  # Allow threads to finish
+            print("Data collection complete!")
+            print("Setting ODrive to IDLE state...")
+            axis.requested_state = odrive.enums.AXIS_STATE_IDLE
+            print("Motor stopped.")
+            
+            # Even if the move failed, still save the data
+            merge_and_save_data(test_name)
+            
+            return result
     except Exception as e:
-        print(f"Error setting ODrive to IDLE: {e}")
+        print(f"Error during test: {e}")
+        # Clean up if an exception occurs
+        collection_active.clear()
+        try:
+            axis.requested_state = odrive.enums.AXIS_STATE_IDLE
+            print("Motor stopped after error.")
+        except:
+            pass
+        return False
+    finally:
+        # Always ensure collection is stopped
+        collection_active.clear()
+
+# --- Arduino Pre-Test Check ---
+def check_arduino_data(port, baud, duration_sec=5):
+    """
+    Check if Arduino is sending valid data for a specified duration.
+    This serves as a pre-test verification step.
     
-    # Save the data using the helper function
-    merge_and_save_data(test_name)
+    Args:
+        port: Serial port name
+        baud: Baud rate
+        duration_sec: How long to check for data (seconds)
+        
+    Returns:
+        bool: True if valid data was received, False otherwise
+    """
+    global arduino_ser
     
-    return True
+    print(f"\n--- Arduino Pre-Test Check ({duration_sec} seconds) ---")
+    print("Checking if Arduino is sending data correctly...")
+    
+    # Always close the existing connection first to avoid resource conflicts
+    if arduino_ser is not None:
+        try:
+            arduino_ser.close()
+            print("Closed existing Arduino connection")
+            time.sleep(0.5)  # Wait to ensure port is released
+        except Exception as e:
+            print(f"Error closing existing Arduino connection: {e}")
+        arduino_ser = None
+    
+    try:
+        # Open Arduino connection
+        print(f"Opening Arduino serial port {port} at {baud} baud...")
+        arduino_ser = serial.Serial(port, baud, timeout=0.5)
+        print("Arduino connection established")
+        arduino_ser.flushInput()
+        
+        # Variables for tracking data received
+        data_count = 0
+        start_time = time.time()
+        valid_json_count = 0
+        sample_data = []  # Store a few samples
+        
+        # Read data for specified duration
+        while time.time() - start_time < duration_sec:
+            if arduino_ser.in_waiting > 0:
+                try:
+                    raw_data = arduino_ser.readline()
+                    data_str = raw_data.decode('utf-8').strip()
+                    
+                    if data_str:
+                        data_count += 1
+                        
+                        # Try to parse as JSON to verify format
+                        try:
+                            data_json = json.loads(data_str)
+                            valid_json_count += 1
+                            
+                            # Store a few samples for display
+                            if len(sample_data) < 3:
+                                sample_data.append(data_str[:50] + "..." if len(data_str) > 50 else data_str)
+                                
+                            # Print real-time feedback
+                            elapsed = time.time() - start_time
+                            print(f"\rReceived {data_count} messages ({valid_json_count} valid JSON) in {elapsed:.1f}s", end="")
+                                
+                        except json.JSONDecodeError:
+                            print(f"\rReceived non-JSON data: {data_str[:30]}...", end="")
+                            
+                except Exception as e:
+                    print(f"\nError reading Arduino data: {e}")
+            
+            # Short sleep to avoid tight loop
+            time.sleep(0.01)
+        
+        # Final newline
+        print("\n")
+        
+        # Close the connection
+        arduino_ser.close()
+        arduino_ser = None
+        
+        # Display results
+        if data_count > 0:
+            print(f"Arduino check complete: Received {data_count} messages ({valid_json_count} valid JSON)")
+            if sample_data:
+                print("\nSample data received:")
+                for i, sample in enumerate(sample_data, 1):
+                    print(f"  Sample {i}: {sample}")
+            print("\nArduino is sending data correctly!")
+            return True
+        else:
+            print("Arduino check failed: No data received")
+            print("\nPlease check:")
+            print("  1. Arduino is properly connected and powered")
+            print("  2. The correct sketch is uploaded to the Arduino")
+            print("  3. The COM port setting is correct")
+            return False
+            
+    except serial.SerialException as e:
+        print(f"Error opening Arduino port: {e}")
+        print("Arduino pre-test check failed")
+        return False
+    except Exception as e:
+        print(f"Unexpected error during Arduino check: {e}")
+        return False
+    finally:
+        # Ensure port is closed
+        if arduino_ser is not None:
+            try:
+                arduino_ser.close()
+                arduino_ser = None
+            except:
+                pass
+
+# --- System Configuration ---
+def cleanup_resources(signum=None, frame=None):
+    """
+    Ensure all resources are properly closed when exiting.
+    This helps prevent port access conflicts on subsequent runs.
+    """
+    global arduino_ser, collection_active
+    print("\nCleaning up resources...")
+    
+    # Stop any active collection
+    collection_active.clear()
+    
+    # Close Arduino serial connection if open
+    if arduino_ser is not None:
+        try:
+            arduino_ser.close()
+            print("Arduino serial port closed")
+        except Exception as e:
+            print(f"Error closing Arduino port: {e}")
+        arduino_ser = None
+    
+    print("Cleanup complete")
+
+# Register cleanup for normal exit and signals
+atexit.register(cleanup_resources)
+signal.signal(signal.SIGINT, cleanup_resources)  # Handle Ctrl+C
+signal.signal(signal.SIGTERM, cleanup_resources)  # Handle termination
 
 # --- Main Execution Logic (Using Step-by-Step Calibration) ---
 def main():
@@ -546,6 +750,20 @@ def main():
     
     # Clear any existing errors
     clear_all_odrive_errors(odrv)
+    
+    # First check if Arduino is sending data correctly
+    print("\nFirst, let's verify that Arduino is sending data correctly.")
+    arduino_data_ok = check_arduino_data(ARDUINO_PORT, ARDUINO_BAUD, duration_sec=5)
+    
+    if arduino_data_ok:
+        print("Arduino data check passed. Proceeding with calibration.")
+    else:
+        print("WARNING: Arduino data check failed!")
+        proceed = input("Would you like to proceed without Arduino data? (y/n): ").strip().lower()
+        if proceed != 'y':
+            print("Exiting test sequence.")
+            return
+        print("Proceeding with ODrive tests only (no Arduino data).")
     
     # Run Calibration
     print("\n*** WARNING: ODrive calibration will spin the motor. ***")
